@@ -13,7 +13,12 @@ from core.amazon import (
     fetch_bestseller_products,
     normalize_product_table,
 )
-from core.competitor import DEFAULT_BRANDS, collect_google_news, normalize_intelligence_table
+from core.competitor import (
+    DATE_STATUS_OPTIONS,
+    DEFAULT_BRANDS,
+    collect_google_news,
+    normalize_intelligence_table,
+)
 from core.llm import (
     LLMSettings,
     analyze_market,
@@ -86,7 +91,10 @@ PRODUCT_TEMPLATE_COLUMNS = [
 ]
 REVIEW_TEMPLATE_COLUMNS = ["asin", "rating", "review_title", "review_text", "review_date"]
 INTEL_TEMPLATE_COLUMNS = [
-    "discovered_at",
+    "published_at",
+    "collected_at",
+    "date_status",
+    "source_published_at_raw",
     "region",
     "brand",
     "category",
@@ -540,16 +548,41 @@ def render_bsr_module(
 
 
 def render_competitor_module(store: SnapshotStore) -> None:
-    hero("需求三｜全球竞品新品情报", "每周搜集新品、预告、上市、认证、专利与社媒线索")
+    hero(
+        "需求三｜全球竞品新品情报",
+        "按文章来源发布时间筛选和排序，并记录系统采集时间",
+    )
     st.markdown("#### 1. 选择监控品牌")
     brands = st.multiselect("品牌", DEFAULT_BRANDS, default=DEFAULT_BRANDS)
-    max_per_brand = st.slider("每个品牌最多获取", 1, 10, 3)
+    filter_col, count_col = st.columns(2)
+    range_label = filter_col.selectbox(
+        "文章来源时间范围",
+        ["最近7天", "最近30天", "最近90天", "最近1年", "不限时间"],
+        index=1,
+        help="同时限制 Google News 查询并在采集后再次校验发布日期。",
+    )
+    lookback_days = {
+        "最近7天": 7,
+        "最近30天": 30,
+        "最近90天": 90,
+        "最近1年": 365,
+        "不限时间": None,
+    }[range_label]
+    max_per_brand = count_col.slider("每个品牌最多获取", 1, 10, 3)
+    st.caption(
+        "“文章发布日期”来自 Google News RSS；“系统采集时间”是本工具实际取得该线索的时间。"
+        "日期缺失或异常时会明确标记，不再用当天日期代替。"
+    )
     state_key = "competitor_intel"
     col1, col2 = st.columns([1, 1])
     if col1.button("搜集公开新品信息", type="primary"):
         with st.spinner("正在查询公开信息并去重……"):
             try:
-                result = collect_google_news(brands, max_per_brand=max_per_brand)
+                result = collect_google_news(
+                    brands,
+                    max_per_brand=max_per_brand,
+                    lookback_days=lookback_days,
+                )
                 st.session_state[state_key] = result
                 st.session_state.pop("competitor_summary", None)
                 st.session_state.pop("competitor_analysis_mode", None)
@@ -574,6 +607,12 @@ def render_competitor_module(store: SnapshotStore) -> None:
             hide_index=True,
             num_rows="dynamic",
             column_config={
+                "published_at": st.column_config.TextColumn("文章发布日期"),
+                "collected_at": st.column_config.TextColumn("系统采集时间"),
+                "source_published_at_raw": st.column_config.TextColumn("来源原始时间"),
+                "date_status": st.column_config.SelectboxColumn(
+                    "日期状态", options=DATE_STATUS_OPTIONS
+                ),
                 "source_url": st.column_config.LinkColumn("来源链接"),
                 "confidence": st.column_config.SelectboxColumn(
                     "可信度", options=["高", "中", "低"]
@@ -590,7 +629,7 @@ def render_competitor_module(store: SnapshotStore) -> None:
             min_value=1,
             max_value=min(80, len(intel)),
             value=min(30, len(intel)),
-            help="候选信息较多时建议先分析最近30条，避免一次产生过多请求或触发接口限流。",
+            help="全部品牌已按文章发布日期统一从新到旧排序，大模型优先分析最新线索。",
         )
         if config.enabled:
             if st.button("DeepSeek分析并生成竞品报告", type="primary"):
@@ -608,10 +647,15 @@ def render_competitor_module(store: SnapshotStore) -> None:
         st.caption(
             f"分析方式：{st.session_state.get('competitor_analysis_mode', '尚未调用DeepSeek')}"
         )
-        c1, c2, c3 = st.columns(3)
+        c1, c2, c3, c4 = st.columns(4)
         c1.metric("候选信息", len(intel))
         c2.metric("涉及品牌", intel["brand"].nunique())
         c3.metric("高可信信息", int((intel["confidence"] == "高").sum()))
+        c4.metric(
+            "日期待复核",
+            int((intel["date_status"] != "已解析").sum()),
+            help="包括日期缺失、无效、未来异常及旧版历史字段。",
+        )
     else:
         st.caption("尚无竞品情报。自动搜索失败时可上传人工收集的表格。")
 
@@ -791,7 +835,7 @@ def render_data_center(store: SnapshotStore) -> None:
                 "OPENAI_API_BASE", value=config.base_url or "https://api.deepseek.com"
             )
             model_input = st.text_input(
-                "MODEL_ID", value=config.model or "openai/deepseek-v4-flash"
+                "MODEL_ID", value=config.model or "deepseek-v4-flash"
             )
             save_clicked = st.form_submit_button("保存本地 DeepSeek 配置", type="primary")
         if save_clicked:

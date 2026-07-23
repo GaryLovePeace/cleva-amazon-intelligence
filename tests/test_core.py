@@ -1,11 +1,13 @@
 import importlib.util
 import tempfile
 import unittest
+from datetime import datetime, timedelta, timezone
 from unittest.mock import patch
 
 import pandas as pd
 
 from core.amazon import normalize_product_table, parse_product_detail_html
+from core.competitor import collect_google_news, normalize_intelligence_table
 from core.llm import (
     LLMSettings,
     analyze_market,
@@ -201,7 +203,7 @@ class CoreTests(unittest.TestCase):
             loaded = settings_from_env()
         self.assertEqual(loaded.api_key, "secret")
         self.assertEqual(loaded.base_url, "https://api.deepseek.com")
-        self.assertEqual(loaded.model, "openai/deepseek-v4-flash")
+        self.assertEqual(loaded.model, "deepseek-v4-flash")
 
     def test_merge_sku_insights(self):
         products = pd.DataFrame([{"asin": "B012345678", "title": "Vacuum"}])
@@ -287,6 +289,124 @@ class CoreTests(unittest.TestCase):
         )
         self.assertEqual(result["response_plan"], ["补充无绳SKU"])
         self.assertIn("大模型", result["analysis_mode"])
+
+    def test_competitor_dates_are_split_sorted_and_auditable(self):
+        source = pd.DataFrame(
+            [
+                {
+                    "published_at": "2026-07-01",
+                    "collected_at": "2026-07-23T10:00:00+00:00",
+                    "source_url": "old",
+                    "brand": "Bissell",
+                },
+                {
+                    "published_at": "2026-07-20",
+                    "collected_at": "2026-07-23T10:00:00+00:00",
+                    "source_url": "new",
+                    "brand": "DEWALT",
+                },
+                {
+                    "published_at": "2099-01-01",
+                    "collected_at": "2026-07-23T10:00:00+00:00",
+                    "source_url": "future",
+                    "brand": "Ryobi",
+                },
+            ]
+        )
+        result = normalize_intelligence_table(source)
+        self.assertEqual(result.loc[0, "source_url"], "new")
+        self.assertEqual(result.loc[1, "source_url"], "old")
+        future = result.loc[result["source_url"] == "future"].iloc[0]
+        self.assertEqual(future["published_at"], "")
+        self.assertEqual(future["date_status"], "未来日期异常")
+        self.assertEqual(future["source_published_at_raw"], "2099-01-01")
+
+    @patch("core.competitor.urlopen")
+    def test_competitor_collection_filters_old_news(self, mocked_urlopen):
+        now = datetime.now(timezone.utc)
+
+        def rss_date(value):
+            return value.strftime("%a, %d %b %Y %H:%M:%S GMT")
+
+        rss = f"""<?xml version="1.0" encoding="UTF-8"?>
+        <rss><channel>
+          <item><title>Brand launches recent vacuum</title><link>recent</link>
+            <description>Recent product</description>
+            <pubDate>{rss_date(now - timedelta(days=5))}</pubDate></item>
+          <item><title>Brand launches old vacuum</title><link>old</link>
+            <description>Old product</description>
+            <pubDate>{rss_date(now - timedelta(days=60))}</pubDate></item>
+          <item><title>Brand launches unknown vacuum</title><link>missing</link>
+            <description>Unknown date</description></item>
+          <item><title>Brand launches future vacuum</title><link>future</link>
+            <description>Bad date</description>
+            <pubDate>{rss_date(now + timedelta(days=3))}</pubDate></item>
+        </channel></rss>""".encode()
+
+        class FakeResponse:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+            def read(self):
+                return rss
+
+        mocked_urlopen.return_value = FakeResponse()
+        result = collect_google_news(["Brand"], max_per_brand=5, lookback_days=30)
+        self.assertEqual(set(result["source_url"]), {"recent", "missing", "future"})
+        self.assertNotIn("old", set(result["source_url"]))
+        self.assertEqual(
+            result.loc[result["source_url"] == "missing", "date_status"].iloc[0],
+            "日期缺失",
+        )
+        request = mocked_urlopen.call_args.args[0]
+        self.assertIn("when%3A30d", request.full_url)
+
+    def test_legacy_competitor_date_remains_compatible(self):
+        source = pd.DataFrame(
+            [
+                {
+                    "discovered_at": "2026-06-01",
+                    "source_url": "legacy",
+                    "brand": "Hoover",
+                }
+            ]
+        )
+        result = normalize_intelligence_table(source)
+        self.assertEqual(result.loc[0, "published_at"], "2026-06-01")
+        self.assertEqual(result.loc[0, "date_status"], "历史字段（待复核）")
+        self.assertTrue(result.loc[0, "collected_at"])
+
+    @patch("core.llm._call_json")
+    def test_competitor_deepseek_prioritizes_latest_items(self, mocked_call):
+        mocked_call.return_value = {"items": []}
+        source = pd.DataFrame(
+            [
+                {
+                    "published_at": "2026-01-01",
+                    "brand": "Old",
+                    "source_title": "Old launch",
+                    "source_url": "old",
+                },
+                {
+                    "published_at": "2026-07-20",
+                    "brand": "New",
+                    "source_title": "New launch",
+                    "source_url": "new",
+                },
+            ]
+        )
+        result, _ = enrich_competitor_intelligence(
+            source,
+            LLMSettings("key", "https://api.deepseek.com", "model"),
+            max_items=1,
+        )
+        self.assertEqual(result.loc[0, "brand"], "New")
+        user_payload = mocked_call.call_args.args[1][1]["content"]
+        self.assertIn('"brand": "New"', user_payload)
+        self.assertNotIn('"brand": "Old"', user_payload)
 
     @patch("core.llm._call_json")
     def test_sales_deepseek_diagnostics(self, mocked_call):

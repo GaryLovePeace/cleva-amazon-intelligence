@@ -280,6 +280,7 @@ def build_competitor_html(intel: pd.DataFrame, summary: dict) -> bytes:
         + "<h2>情报明细</h2>"
         + intel.to_html(index=False, escape=True, border=0)
         + f"<p class='note'>分析方式：{html.escape(str(summary.get('analysis_mode', '本地汇总')))}。"
+        "文章发布日期来自公开新闻源，仅代表新闻线索时间，不等于产品正式上市日期；"
         "候选情报及AI提取结果均需回到原始来源人工复核。</p>"
     )
     return _report_html("CLEVA全球竞品新品情报报告", body)

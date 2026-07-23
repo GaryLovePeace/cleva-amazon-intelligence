@@ -32,22 +32,26 @@ def settings_from_env(data_dir: str | None = None) -> LLMSettings:
                 saved = json.loads(config_path.read_text(encoding="utf-8"))
             except (OSError, json.JSONDecodeError):
                 saved = {}
+    base_url = (
+        os.getenv("OPENAI_API_BASE")
+        or os.getenv("AI_BASE_URL")
+        or saved.get("base_url", "https://api.deepseek.com")
+    ).rstrip("/")
+    model = (
+        os.getenv("MODEL_ID")
+        or os.getenv("AI_MODEL")
+        or saved.get("model", "deepseek-v4-flash")
+    )
+    if "api.deepseek.com" in base_url.lower() and model.startswith("openai/"):
+        model = model.split("/", 1)[1]
     return LLMSettings(
         api_key=(
             os.getenv("OPENAI_API_KEY")
             or os.getenv("AI_API_KEY")
             or saved.get("api_key", "")
         ),
-        base_url=(
-            os.getenv("OPENAI_API_BASE")
-            or os.getenv("AI_BASE_URL")
-            or saved.get("base_url", "https://api.deepseek.com")
-        ).rstrip("/"),
-        model=(
-            os.getenv("MODEL_ID")
-            or os.getenv("AI_MODEL")
-            or saved.get("model", "openai/deepseek-v4-flash")
-        ),
+        base_url=base_url,
+        model=model,
     )
 
 
@@ -225,9 +229,12 @@ def _parse_json_content(content: str) -> dict:
 
 
 def _call_json(settings: LLMSettings, messages: list[dict]) -> dict:
+    model = settings.model
+    if "api.deepseek.com" in settings.base_url.lower() and model.startswith("openai/"):
+        model = model.split("/", 1)[1]
     payload = json.dumps(
         {
-            "model": settings.model,
+            "model": model,
             "messages": messages,
             "temperature": 0.2,
             "response_format": {"type": "json_object"},
@@ -502,6 +509,20 @@ def enrich_competitor_intelligence(
     intelligence: pd.DataFrame, settings: LLMSettings, max_items: int = 60
 ) -> tuple[pd.DataFrame, str]:
     result = intelligence.copy().reset_index(drop=True)
+    if "published_at" in result:
+        result["_published_sort"] = pd.to_datetime(
+            result["published_at"], errors="coerce", utc=True
+        )
+        result = (
+            result.sort_values(
+                "_published_sort",
+                ascending=False,
+                na_position="last",
+                kind="stable",
+            )
+            .drop(columns=["_published_sort"])
+            .reset_index(drop=True)
+        )
     for column in [
         "competitive_impact",
         "recommended_action",
@@ -518,7 +539,9 @@ def enrich_competitor_intelligence(
     selected_columns = [
         column
         for column in [
-            "discovered_at",
+            "published_at",
+            "collected_at",
+            "date_status",
             "region",
             "brand",
             "category",
@@ -667,7 +690,9 @@ def summarize_competitor_intelligence(
     fields = [
         field
         for field in [
-            "discovered_at",
+            "published_at",
+            "collected_at",
+            "date_status",
             "brand",
             "category",
             "product_name",

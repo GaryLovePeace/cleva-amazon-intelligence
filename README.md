@@ -20,7 +20,11 @@
   只有上传评论后才会出现 VOC 分析结果
 - 需求一、二均可下载商业分析 Excel 和独立 HTML 报告
 - Spot Cleaner 自动生成美系与中国出海品牌的技术对比
-- 搜集公开新品新闻，使用 DeepSeek 提取型号、规格、定价策略、竞争影响和应对动作
+- 搜集公开新品新闻，区分“文章发布日期”和“系统采集时间”，支持最近 7/30/90 天、
+  最近 1 年或不限时间筛选
+- 全部品牌线索会按文章发布日期统一从新到旧排序；日期缺失、无效或未来异常会单独标记，
+  不再用当天日期代替
+- 使用 DeepSeek 优先分析最新线索，并提取型号、规格、定价策略、竞争影响和应对动作
 - 需求三采用小批次 DeepSeek 分析；部分批次失败时保留已完成结果，并生成核心技术、
   定价策略、CLEVA 竞争影响、应对方案和重点关注清单
 - 需求三可下载包含管理层摘要的 Excel 与 HTML 报告
@@ -36,6 +40,8 @@
 - `bought in past month` 和由此计算的销售额是估算，不是真实 Seller Central 数据。
 - Amazon 官方产品接口通常不能提供所有竞品的完整评论正文，VOC 仍需要评论文件或
   其他合规、授权的数据来源。
+- 需求三的“文章发布日期”来自 Google News RSS，仅代表新闻线索时间，不等同于产品
+  正式上市日期；转载旧闻、日期异常及重要结论仍需回到原始来源复核。
 - 需求四必须上传公司内部 Seller Central 报表，公开店铺页面不能提供真实销售表现。
 - Kenmore 仅应包含 CLEVA 负责的 Floor Care SKU，正式使用前建议导入公司 SKU 白名单。
 
@@ -70,7 +76,7 @@ Mac 本地测试可以进入应用左侧的“数据中心与设置”，填写�
 
 - DeepSeek API Key
 - Base URL：`https://api.deepseek.com`
-- 模型：`openai/deepseek-v4-flash`
+- 模型：`deepseek-v4-flash`
 
 保存后点击“测试 DeepSeek 连接”。四个模块会根据各自任务调用大模型。
 
@@ -79,7 +85,7 @@ Mac 本地测试可以进入应用左侧的“数据中心与设置”，填写�
 ```dotenv
 OPENAI_API_KEY=你的密钥
 OPENAI_API_BASE=https://api.deepseek.com
-MODEL_ID=openai/deepseek-v4-flash
+MODEL_ID=deepseek-v4-flash
 LOCAL_DATA_DIR=data
 ```
 
@@ -96,7 +102,7 @@ LOCAL_DATA_DIR=data
 ```toml
 OPENAI_API_KEY = "你的DeepSeek API Key"
 OPENAI_API_BASE = "https://api.deepseek.com"
-MODEL_ID = "openai/deepseek-v4-flash"
+MODEL_ID = "deepseek-v4-flash"
 ```
 
 顶层 Secrets 会作为环境变量提供给应用。检测到 Secrets 后，应用会隐藏网页密钥编辑表单，
