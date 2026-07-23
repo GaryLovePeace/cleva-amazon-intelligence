@@ -229,7 +229,7 @@ def render_overview(store: SnapshotStore) -> None:
         st.subheader("最近运行")
         st.dataframe(
             recent[["collected_at", "module", "label", "row_count"]],
-            use_container_width=True,
+            width="stretch",
             hide_index=True,
         )
 
@@ -335,7 +335,7 @@ def product_source_panel(category_key: str, url: str) -> pd.DataFrame:
                 st.error(f"详情补全未完成：{exc}")
         edited = st.data_editor(
             products,
-            use_container_width=True,
+            width="stretch",
             hide_index=True,
             num_rows="dynamic",
             column_config={
@@ -408,14 +408,14 @@ def render_bsr_module(
             st.markdown("##### 价格带分析")
             st.dataframe(
                 pd.DataFrame(commercial["price_band_analysis"]),
-                use_container_width=True,
+                width="stretch",
                 hide_index=True,
             )
         if commercial.get("brand_benchmark"):
             st.markdown("##### 品牌价格与能力基准")
             st.dataframe(
                 pd.DataFrame(commercial["brand_benchmark"]),
-                use_container_width=True,
+                width="stretch",
                 hide_index=True,
             )
         positioning = commercial.get("vacmaster_positioning")
@@ -426,7 +426,7 @@ def render_bsr_module(
                     pd.DataFrame(
                         [{"分析项": key, "结论": value} for key, value in positioning.items()]
                     ),
-                    use_container_width=True,
+                    width="stretch",
                     hide_index=True,
                 )
             else:
@@ -435,7 +435,7 @@ def render_bsr_module(
             st.markdown("##### Vacmaster与竞品能力差异")
             st.dataframe(
                 pd.DataFrame(commercial["capability_comparison"]),
-                use_container_width=True,
+                width="stretch",
                 hide_index=True,
             )
         if commercial.get("brand_comparison"):
@@ -490,7 +490,7 @@ def render_bsr_module(
             st.error(f"评论文件读取失败：{exc}")
     reviews = st.session_state.get(reviews_key, pd.DataFrame(columns=REVIEW_TEMPLATE_COLUMNS))
     if not reviews.empty:
-        st.dataframe(reviews.head(200), use_container_width=True, hide_index=True)
+        st.dataframe(reviews.head(200), width="stretch", hide_index=True)
     voc_key = f"{category_key}_voc_analysis"
     if st.button(
         "生成 VOC 报告",
@@ -511,13 +511,13 @@ def render_bsr_module(
         st.markdown("##### VOC 痛点")
         pain_points = voc.get("pain_points", [])
         if pain_points:
-            st.dataframe(pd.DataFrame(pain_points), use_container_width=True, hide_index=True)
+            st.dataframe(pd.DataFrame(pain_points), width="stretch", hide_index=True)
         else:
             st.caption("暂无足够评论生成痛点占比。")
         st.markdown("##### 好评核心卖点")
         selling_points = voc.get("selling_points", [])
         if selling_points:
-            st.dataframe(pd.DataFrame(selling_points), use_container_width=True, hide_index=True)
+            st.dataframe(pd.DataFrame(selling_points), width="stretch", hide_index=True)
         else:
             st.caption("暂无足够4-5星评论生成卖点。")
         st.markdown("##### VOC改进建议")
@@ -570,7 +570,7 @@ def render_competitor_module(store: SnapshotStore) -> None:
         intel = normalize_intelligence_table(intel)
         intel = st.data_editor(
             intel,
-            use_container_width=True,
+            width="stretch",
             hide_index=True,
             num_rows="dynamic",
             column_config={
@@ -724,7 +724,7 @@ def render_sales_module(store: SnapshotStore) -> None:
         )
         st.dataframe(
             result,
-            use_container_width=True,
+            width="stretch",
             hide_index=True,
             column_config={"product_url": st.column_config.LinkColumn("Amazon链接")},
         )
@@ -834,7 +834,7 @@ def render_data_center(store: SnapshotStore) -> None:
     if snapshots.empty:
         st.caption("暂无历史快照。")
     else:
-        st.dataframe(snapshots, use_container_width=True, hide_index=True)
+        st.dataframe(snapshots, width="stretch", hide_index=True)
         st.download_button(
             "下载快照索引 CSV",
             dataframe_to_csv_bytes(snapshots),
