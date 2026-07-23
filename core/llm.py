@@ -1,0 +1,423 @@
+from __future__ import annotations
+
+import json
+import os
+import re
+from dataclasses import dataclass
+from pathlib import Path
+from urllib.request import Request, urlopen
+
+import pandas as pd
+
+
+@dataclass
+class LLMSettings:
+    api_key: str
+    base_url: str
+    model: str
+
+    @property
+    def enabled(self) -> bool:
+        return bool(self.api_key and self.base_url and self.model)
+
+
+def settings_from_env(data_dir: str | None = None) -> LLMSettings:
+    saved = {}
+    if data_dir:
+        config_path = Path(data_dir) / "deepseek_config.json"
+        if config_path.exists():
+            try:
+                saved = json.loads(config_path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                saved = {}
+    return LLMSettings(
+        api_key=(
+            os.getenv("OPENAI_API_KEY")
+            or os.getenv("AI_API_KEY")
+            or saved.get("api_key", "")
+        ),
+        base_url=(
+            os.getenv("OPENAI_API_BASE")
+            or os.getenv("AI_BASE_URL")
+            or saved.get("base_url", "https://api.deepseek.com")
+        ).rstrip("/"),
+        model=(
+            os.getenv("MODEL_ID")
+            or os.getenv("AI_MODEL")
+            or saved.get("model", "openai/deepseek-v4-flash")
+        ),
+    )
+
+
+def save_settings(data_dir: str, settings: LLMSettings) -> Path:
+    folder = Path(data_dir)
+    folder.mkdir(parents=True, exist_ok=True)
+    path = folder / "deepseek_config.json"
+    path.write_text(
+        json.dumps(
+            {
+                "api_key": settings.api_key,
+                "base_url": settings.base_url.rstrip("/"),
+                "model": settings.model,
+            },
+            ensure_ascii=False,
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+    return path
+
+
+def _local_analysis(
+    products: pd.DataFrame, local_voc: list[dict], category_key: str
+) -> dict:
+    brand_counts = products["brand"].replace("", pd.NA).dropna().value_counts()
+    leaders = "、".join(f"{brand}（{count}款）" for brand, count in brand_counts.head(5).items())
+    price = products["price"].dropna()
+    if not price.empty:
+        price_text = f"价格中位数约 ${price.median():.2f}，区间 ${price.min():.2f}-${price.max():.2f}。"
+    else:
+        price_text = "当前数据没有足够的有效价格。"
+    category_name = "便携织物清洗机" if category_key == "spot_cleaner" else "干湿两用吸尘器"
+    recommendations = [
+        "优先处理高频结构性痛点，并在详情页以可量化证据表达改进。",
+        "围绕主流价位段建立基础款、主推款和差异化高配款。",
+        "将售后高频问题转化为安装、维护和使用场景内容。",
+    ]
+    if category_key == "spot_cleaner":
+        recommendations.insert(0, "重点验证软管耐久、水箱密封、抽取残水与管道自清洁能力。")
+    return {
+        "market_landscape": (
+            f"当前样本包含 {len(products)} 款{category_name}。"
+            f"品牌出现情况：{leaders or '品牌字段不足'}。{price_text}"
+        ),
+        "pain_points": local_voc,
+        "selling_points": [],
+        "brand_comparison": "",
+        "sku_insights": [],
+        "recommendations": recommendations,
+        "analysis_mode": "本地规则（未调用外部大模型）",
+    }
+
+
+def _parse_json_content(content: str) -> dict:
+    cleaned = content.strip()
+    cleaned = re.sub(r"^```(?:json)?\s*", "", cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(r"\s*```$", "", cleaned)
+    return json.loads(cleaned)
+
+
+def _call_json(settings: LLMSettings, messages: list[dict]) -> dict:
+    payload = json.dumps(
+        {
+            "model": settings.model,
+            "messages": messages,
+            "temperature": 0.2,
+            "response_format": {"type": "json_object"},
+        },
+        ensure_ascii=False,
+    ).encode("utf-8")
+    request = Request(
+        f"{settings.base_url}/chat/completions",
+        data=payload,
+        method="POST",
+        headers={
+            "Authorization": f"Bearer {settings.api_key}",
+            "Content-Type": "application/json",
+        },
+    )
+    with urlopen(request, timeout=60) as response:
+        body = json.loads(response.read().decode("utf-8"))
+    return _parse_json_content(body["choices"][0]["message"]["content"])
+
+
+def _safe_records(frame: pd.DataFrame, limit: int, text_limit: int = 700) -> list[dict]:
+    records = frame.head(limit).astype(object).where(pd.notna(frame.head(limit)), "").to_dict(
+        orient="records"
+    )
+    for record in records:
+        for key, value in list(record.items()):
+            if isinstance(value, str) and len(value) > text_limit:
+                record[key] = value[:text_limit]
+    return records
+
+
+def _chunks(records: list[dict], size: int) -> list[list[dict]]:
+    return [records[index : index + size] for index in range(0, len(records), size)]
+
+
+def test_connection(settings: LLMSettings) -> str:
+    if not settings.enabled:
+        raise ValueError("请填写 API Key、Base URL 和模型名称。")
+    result = _call_json(
+        settings,
+        [
+            {
+                "role": "system",
+                "content": "只输出JSON，格式为 {\"status\":\"ok\",\"message\":\"connected\"}。",
+            },
+            {"role": "user", "content": "测试连接。"},
+        ],
+    )
+    return str(result.get("message") or result.get("status") or "connected")
+
+
+def analyze_market(
+    products: pd.DataFrame,
+    reviews: pd.DataFrame,
+    local_voc: list[dict],
+    category_key: str,
+    settings: LLMSettings,
+) -> dict:
+    fallback = _local_analysis(products, local_voc, category_key)
+    if not settings.enabled:
+        return fallback
+    product_records = _safe_records(products, 50)
+    review_records = _safe_records(reviews, 400)
+    prompt = {
+        "category": category_key,
+        "products": product_records,
+        "reviews": review_records,
+        "rule_based_voc": local_voc,
+        "required_schema": {
+            "market_landscape": "string",
+            "pain_points": [{"pain_point": "string", "mentions": 0, "mention_rate": 0.0}],
+            "selling_points": [
+                {"selling_point": "string", "mentions": 0, "mention_rate": 0.0}
+            ],
+            "brand_comparison": "string，spot_cleaner品类必须比较美系与中国出海品牌",
+            "sku_insights": [
+                {
+                    "asin": "string",
+                    "pain_points": ["string"],
+                    "selling_points": ["string"],
+                    "use_scenarios": ["string"],
+                    "differentiation_recommendation": "string",
+                    "confidence": "high|medium|low",
+                }
+            ],
+            "recommendations": ["string"],
+        },
+    }
+    try:
+        result = _call_json(
+            settings,
+            [
+                {
+                    "role": "system",
+                    "content": (
+                        "你是CLEVA市场情报分析师。只根据输入数据作答，不得捏造销量、份额或规格。"
+                        "区分1-3星痛点与4-5星卖点，输出严格JSON。"
+                        "spot_cleaner必须分析Bissell/Hoover等美系品牌与"
+                        "Tineco/UWANT/Dreame等中国出海品牌的技术差异。"
+                        "sku_insights只能引用输入中存在的ASIN。建议应具体、可执行，并明确估算数据。"
+                    ),
+                },
+                {
+                    "role": "user",
+                    "content": json.dumps(prompt, ensure_ascii=False, default=str),
+                },
+            ],
+        )
+        result["analysis_mode"] = f"大模型：{settings.model}"
+        return result
+    except Exception as exc:
+        fallback["analysis_mode"] += f"；大模型调用失败，已自动回退：{type(exc).__name__}"
+        return fallback
+
+
+def merge_sku_insights(products: pd.DataFrame, analysis: dict) -> pd.DataFrame:
+    result = products.copy()
+    rows = []
+    for item in analysis.get("sku_insights", []) or []:
+        if not isinstance(item, dict):
+            continue
+        asin = str(item.get("asin", "")).strip()
+        if not asin:
+            continue
+        rows.append(
+            {
+                "asin": asin,
+                "llm_pain_points": "；".join(map(str, item.get("pain_points", []) or [])),
+                "llm_selling_points": "；".join(
+                    map(str, item.get("selling_points", []) or [])
+                ),
+                "llm_use_scenarios": "；".join(
+                    map(str, item.get("use_scenarios", []) or [])
+                ),
+                "llm_differentiation": str(
+                    item.get("differentiation_recommendation", "")
+                ),
+                "llm_confidence": str(item.get("confidence", "")),
+            }
+        )
+    columns = [
+        "llm_pain_points",
+        "llm_selling_points",
+        "llm_use_scenarios",
+        "llm_differentiation",
+        "llm_confidence",
+    ]
+    if rows:
+        insights = pd.DataFrame(rows).drop_duplicates("asin", keep="first")
+        result = result.merge(insights, on="asin", how="left")
+    for column in columns:
+        if column not in result:
+            result[column] = ""
+        result[column] = result[column].fillna("")
+    return result
+
+
+def enrich_competitor_intelligence(
+    intelligence: pd.DataFrame, settings: LLMSettings
+) -> tuple[pd.DataFrame, str]:
+    result = intelligence.copy().reset_index(drop=True)
+    for column in [
+        "competitive_impact",
+        "recommended_action",
+        "llm_summary",
+        "llm_confidence",
+    ]:
+        if column not in result:
+            result[column] = ""
+    if result.empty or not settings.enabled:
+        return result, "本地规则（未调用外部大模型）"
+
+    records = _safe_records(result, len(result))
+    for row_id, record in enumerate(records):
+        record["_row_id"] = row_id
+    try:
+        updates: list[dict] = []
+        for batch in _chunks(records, 12):
+            payload = {
+                "items": batch,
+                "required_schema": {
+                    "items": [
+                        {
+                            "_row_id": 0,
+                            "category": "string",
+                            "product_name": "string",
+                            "model": "string",
+                            "status": "Active Sales|Pre-order|Teaser|Leak|待判断",
+                            "core_specs": "string",
+                            "price_strategy": "string",
+                            "competitive_impact": "string",
+                            "recommended_action": "string",
+                            "summary": "string",
+                            "confidence": "高|中|低",
+                        }
+                    ]
+                },
+            }
+            response = _call_json(
+                settings,
+                [
+                    {
+                        "role": "system",
+                        "content": (
+                            "你是CLEVA全球竞品情报分析师。仅依据标题、摘要和来源字段提取信息，"
+                            "不得猜测不存在的型号、价格或规格。缺失字段留空。输出严格JSON。"
+                        ),
+                    },
+                    {
+                        "role": "user",
+                        "content": json.dumps(payload, ensure_ascii=False, default=str),
+                    },
+                ],
+            )
+            updates.extend(response.get("items", []) or [])
+        for item in updates:
+            row_id = item.get("_row_id")
+            if not isinstance(row_id, int) or not 0 <= row_id < len(result):
+                continue
+            mapping = {
+                "category": "category",
+                "product_name": "product_name",
+                "model": "model",
+                "status": "status",
+                "core_specs": "core_specs",
+                "price_strategy": "price_strategy",
+                "competitive_impact": "competitive_impact",
+                "recommended_action": "recommended_action",
+                "summary": "llm_summary",
+                "confidence": "llm_confidence",
+            }
+            for source, target in mapping.items():
+                value = item.get(source)
+                if value not in (None, ""):
+                    result.at[row_id, target] = value
+        return result, f"大模型：{settings.model}"
+    except Exception as exc:
+        return result, f"DeepSeek调用失败，保留原始数据：{type(exc).__name__}"
+
+
+def enrich_sales_diagnostics(
+    sales: pd.DataFrame, settings: LLMSettings
+) -> tuple[pd.DataFrame, str]:
+    result = sales.copy().reset_index(drop=True)
+    result["diagnosis_source"] = "规则"
+    result["risk_level"] = result.get("risk_level", "")
+    result["evidence"] = result.get("evidence", "")
+    result["action_priority"] = result.get("action_priority", "")
+    if result.empty or not settings.enabled or "needs_attention" not in result:
+        return result, "本地规则（未调用外部大模型）"
+
+    abnormal = result[result["needs_attention"].fillna(False)].copy()
+    if abnormal.empty:
+        return result, f"大模型：{settings.model}（本期无异常SKU，无需调用）"
+    records = _safe_records(abnormal, len(abnormal))
+    row_ids = abnormal.index.tolist()
+    for record, row_id in zip(records, row_ids):
+        record["_row_id"] = int(row_id)
+    try:
+        updates: list[dict] = []
+        for batch in _chunks(records, 15):
+            response = _call_json(
+                settings,
+                [
+                    {
+                        "role": "system",
+                        "content": (
+                            "你是CLEVA Amazon运营分析师。针对变化超过5%的SKU，"
+                            "综合WoW/MoM/QoQ/HoH/YoY、ACoS、CTR、CVR、库存、价格和BSR字段诊断。"
+                            "缺失数据必须明确写为证据不足，不得捏造。输出严格JSON。"
+                        ),
+                    },
+                    {
+                        "role": "user",
+                        "content": json.dumps(
+                            {
+                                "items": batch,
+                                "required_schema": {
+                                    "items": [
+                                        {
+                                            "_row_id": 0,
+                                            "diagnosis": "string",
+                                            "evidence": "string",
+                                            "risk_level": "高|中|低",
+                                            "recommendation": "string",
+                                            "action_priority": "P0|P1|P2",
+                                        }
+                                    ]
+                                },
+                            },
+                            ensure_ascii=False,
+                            default=str,
+                        ),
+                    },
+                ],
+            )
+            updates.extend(response.get("items", []) or [])
+        for item in updates:
+            row_id = item.get("_row_id")
+            if not isinstance(row_id, int) or not 0 <= row_id < len(result):
+                continue
+            result.at[row_id, "diagnosis"] = str(item.get("diagnosis", ""))
+            result.at[row_id, "recommendation"] = str(item.get("recommendation", ""))
+            result.at[row_id, "evidence"] = str(item.get("evidence", ""))
+            result.at[row_id, "risk_level"] = str(item.get("risk_level", ""))
+            result.at[row_id, "action_priority"] = str(item.get("action_priority", ""))
+            result.at[row_id, "diagnosis_source"] = settings.model
+        return result, f"大模型：{settings.model}"
+    except Exception as exc:
+        return result, f"DeepSeek调用失败，已保留规则诊断：{type(exc).__name__}"
