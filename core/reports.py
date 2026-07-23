@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import html
 from io import BytesIO
 
 import pandas as pd
@@ -15,6 +16,25 @@ LIGHT = "EAF1F7"
 GREEN = "D9EAD3"
 RED = "F4CCCC"
 WHITE = "FFFFFF"
+
+
+def _html_list(items) -> str:
+    values = items if isinstance(items, list) else ([items] if items else [])
+    return "<ul>" + "".join(f"<li>{html.escape(str(item))}</li>" for item in values) + "</ul>"
+
+
+def _report_html(title: str, body: str) -> bytes:
+    document = f"""<!doctype html>
+<html lang="zh-CN"><head><meta charset="utf-8"><title>{html.escape(title)}</title>
+<style>
+body{{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;margin:36px;color:#17324d}}
+h1{{border-bottom:4px solid #187b7a;padding-bottom:12px}} h2{{margin-top:30px;color:#155e63}}
+.note{{background:#eef6f5;padding:14px;border-left:5px solid #187b7a}}
+table{{border-collapse:collapse;width:100%;font-size:13px;margin:12px 0 24px}}
+th{{background:#17324d;color:white}} th,td{{border:1px solid #d6dee6;padding:8px;text-align:left;vertical-align:top}}
+tr:nth-child(even){{background:#f6f8fb}} li{{margin:6px 0}}
+</style></head><body><h1>{html.escape(title)}</h1>{body}</body></html>"""
+    return document.encode("utf-8")
 
 
 def _style_sheet(ws, freeze: str = "A2") -> None:
@@ -158,11 +178,111 @@ def build_bsr_workbook(
     return _bytes(wb)
 
 
-def build_competitor_workbook(intel: pd.DataFrame) -> bytes:
+def build_bsr_html(products: pd.DataFrame, analysis: dict, report_title: str) -> bytes:
+    positioning = analysis.get("vacmaster_positioning", {})
+    if isinstance(positioning, dict):
+        positioning_html = "<table><tr><th>分析项</th><th>结论</th></tr>" + "".join(
+            f"<tr><td>{html.escape(str(key))}</td><td>{html.escape(str(value))}</td></tr>"
+            for key, value in positioning.items()
+        ) + "</table>"
+    else:
+        positioning_html = f"<p>{html.escape(str(positioning or '暂无'))}</p>"
+    sections = [
+        f"<h2>市场格局</h2><p>{html.escape(str(analysis.get('market_landscape', '暂无')))}</p>",
+        "<h2>Vacmaster定价与能力定位</h2>" + positioning_html,
+        "<h2>产品与价格机会</h2>" + _html_list(analysis.get("opportunity_gaps", [])),
+        "<h2>应对建议</h2>" + _html_list(analysis.get("recommendations", [])),
+    ]
+    for heading, key in [
+        ("价格带分析", "price_band_analysis"),
+        ("品牌基准", "brand_benchmark"),
+        ("能力差异", "capability_comparison"),
+    ]:
+        rows = analysis.get(key, [])
+        if rows:
+            sections.append(
+                f"<h2>{heading}</h2>"
+                + pd.DataFrame(rows).to_html(index=False, escape=True, border=0)
+            )
+    display_columns = [
+        column
+        for column in [
+            "rank",
+            "asin",
+            "brand",
+            "title",
+            "price",
+            "model",
+            "capacity",
+            "horsepower",
+            "airflow",
+            "suction",
+            "clean_tank_capacity",
+            "dirty_tank_capacity",
+            "heating_or_steam",
+            "accessories",
+            "warranty",
+            "detail_status",
+        ]
+        if column in products
+    ]
+    sections.append(
+        "<h2>Top产品明细</h2>"
+        + products[display_columns].to_html(index=False, escape=True, border=0)
+    )
+    sections.append(
+        f"<p class='note'>分析方式：{html.escape(str(analysis.get('analysis_mode', '本地规则')))}。"
+        "页面月购买量及推算销售额不等于Seller Central真实销量。</p>"
+    )
+    return _report_html(report_title, "".join(sections))
+
+
+def build_competitor_workbook(intel: pd.DataFrame, summary: dict | None = None) -> bytes:
     wb = Workbook()
-    wb.remove(wb.active)
+    if summary:
+        ws = wb.active
+        ws.title = "Executive Summary"
+        ws.append(["模块", "内容"])
+        mapping = [
+            ("管理层摘要", "executive_summary"),
+            ("核心技术规格与卖点", "core_technology_and_selling_points"),
+            ("定价与市场策略", "pricing_and_market_strategy"),
+            ("对CLEVA竞争影响", "competitive_impact_on_cleva"),
+            ("应对方案", "response_plan"),
+            ("重点关注", "priority_watchlist"),
+            ("分析方式", "analysis_mode"),
+        ]
+        for label, key in mapping:
+            value = summary.get(key, "")
+            ws.append([label, "\n".join(map(str, value)) if isinstance(value, list) else str(value)])
+        _style_sheet(ws)
+        ws.column_dimensions["A"].width = 26
+        ws.column_dimensions["B"].width = 110
+    else:
+        wb.remove(wb.active)
     _write_frame(wb, "Competitor Intelligence", intel)
     return _bytes(wb)
+
+
+def build_competitor_html(intel: pd.DataFrame, summary: dict) -> bytes:
+    body = (
+        f"<h2>管理层摘要</h2><p>{html.escape(str(summary.get('executive_summary', '暂无')))}</p>"
+        "<h2>核心技术规格与卖点</h2>"
+        + _html_list(summary.get("core_technology_and_selling_points", []))
+        + "<h2>定价与市场策略</h2>"
+        + _html_list(summary.get("pricing_and_market_strategy", []))
+        + "<h2>对CLEVA（Vacmaster/Lawnmaster）的竞争影响</h2>"
+        + _html_list(summary.get("competitive_impact_on_cleva", []))
+        + "<h2>应对方案</h2>"
+        + _html_list(summary.get("response_plan", []))
+        + "<h2>重点关注清单</h2>"
+        + _html_list(summary.get("priority_watchlist", []))
+        + "<h2>情报明细</h2>"
+        + intel.to_html(index=False, escape=True, border=0)
+        + f"<p class='note'>分析方式：{html.escape(str(summary.get('analysis_mode', '本地汇总')))}。"
+        "候选情报及AI提取结果均需回到原始来源人工复核。</p>"
+    )
+    return _report_html("CLEVA全球竞品新品情报报告", body)
 
 
 def build_sales_workbook(result: pd.DataFrame, as_of) -> bytes:

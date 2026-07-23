@@ -9,11 +9,13 @@ from core.amazon import normalize_product_table, parse_product_detail_html
 from core.llm import (
     LLMSettings,
     analyze_market,
+    analyze_voc_report,
     enrich_competitor_intelligence,
     enrich_sales_diagnostics,
     merge_sku_insights,
     save_settings,
     settings_from_env,
+    summarize_competitor_intelligence,
 )
 from core.seller_reports import build_sales_analysis
 from core.storage import SnapshotStore
@@ -98,6 +100,29 @@ class CoreTests(unittest.TestCase):
         self.assertTrue(analysis["price_band_analysis"])
         self.assertTrue(analysis["brand_benchmark"])
         self.assertIn("价格定位", analysis["vacmaster_positioning"])
+
+    @patch("core.llm._call_json")
+    def test_voc_is_independent_from_commercial_analysis(self, mocked_call):
+        mocked_call.return_value = {
+            "voc_summary": "评论显示软管耐用性问题",
+            "pain_points": [{"pain_point": "软管破裂", "mentions": 2, "mention_rate": 50}],
+            "selling_points": [{"selling_point": "吸力强", "mentions": 2, "mention_rate": 50}],
+            "sku_insights": [],
+            "recommendations": ["加强软管"],
+        }
+        products = pd.DataFrame([{"asin": "B012345678", "brand": "Vacmaster"}])
+        reviews = pd.DataFrame(
+            [{"asin": "B012345678", "rating": 1, "review_text": "hose cracked"}]
+        )
+        result = analyze_voc_report(
+            products,
+            reviews,
+            [],
+            "wet_dry",
+            LLMSettings("key", "https://api.deepseek.com", "model"),
+        )
+        self.assertEqual(result["voc_summary"], "评论显示软管耐用性问题")
+        self.assertNotIn("price_band_analysis", result)
 
     def test_voc(self):
         reviews = normalize_reviews(
@@ -236,6 +261,32 @@ class CoreTests(unittest.TestCase):
         self.assertEqual(result.loc[0, "model"], "X1")
         self.assertEqual(result.loc[0, "recommended_action"], "对比测试")
         self.assertIn("大模型", mode)
+
+    @patch("core.llm._call_json")
+    def test_competitor_summary(self, mocked_call):
+        mocked_call.return_value = {
+            "executive_summary": "竞品强化无绳产品",
+            "core_technology_and_selling_points": ["无绳平台"],
+            "pricing_and_market_strategy": ["高端定价"],
+            "competitive_impact_on_cleva": ["挤压Lawnmaster"],
+            "response_plan": ["补充无绳SKU"],
+            "priority_watchlist": ["DEWALT新品"],
+        }
+        source = pd.DataFrame(
+            [
+                {
+                    "brand": "DEWALT",
+                    "category": "Lawn & Garden",
+                    "product_name": "60V Mower",
+                    "source_url": "u",
+                }
+            ]
+        )
+        result = summarize_competitor_intelligence(
+            source, LLMSettings("key", "https://api.deepseek.com", "model")
+        )
+        self.assertEqual(result["response_plan"], ["补充无绳SKU"])
+        self.assertIn("大模型", result["analysis_mode"])
 
     @patch("core.llm._call_json")
     def test_sales_deepseek_diagnostics(self, mocked_call):

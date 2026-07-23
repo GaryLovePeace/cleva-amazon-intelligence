@@ -17,15 +17,19 @@ from core.competitor import DEFAULT_BRANDS, collect_google_news, normalize_intel
 from core.llm import (
     LLMSettings,
     analyze_market,
+    analyze_voc_report,
     enrich_competitor_intelligence,
     enrich_sales_diagnostics,
     merge_sku_insights,
     save_settings,
     settings_from_env,
+    summarize_competitor_intelligence,
     test_connection,
 )
 from core.reports import (
+    build_bsr_html,
     build_bsr_workbook,
+    build_competitor_html,
     build_competitor_workbook,
     build_sales_workbook,
     dataframe_to_csv_bytes,
@@ -359,76 +363,64 @@ def render_bsr_module(
 ) -> None:
     hero(title, subtitle)
     products = product_source_panel(category_key, url)
-
-    st.markdown("#### 3. 评论与 VOC、定价和能力分析")
     data_dir = os.getenv("LOCAL_DATA_DIR", "data")
-    llm_config = settings_from_env(data_dir)
-    if llm_config.enabled:
-        st.success(f"DeepSeek 已连接配置：{llm_config.model}。本次分析将调用大模型。")
+    config = settings_from_env(data_dir)
+
+    st.markdown("#### 3. 产品与商业分析报告")
+    if config.enabled:
+        st.success(f"DeepSeek 已连接：{config.model}。商业分析与VOC将分别调用。")
     else:
-        st.warning("DeepSeek 尚未配置。本次只能使用本地规则；请到“数据中心与设置”填写 API Key。")
-    reviews_file = st.file_uploader(
-        "上传评论文件（可选）",
-        type=["csv", "xlsx", "xls"],
-        key=f"{category_key}_reviews_upload",
-        help="建议字段：ASIN、星级、评论标题、评论正文、评论日期。",
-    )
+        st.warning("DeepSeek尚未配置，将生成本地价格带和品牌基准分析。")
     st.caption(
-        "Amazon官方接口通常不能提供所有竞品的完整评论正文。没有评论文件时仍可生成"
-        "价格和能力分析；VOC部分会明确标记为“评论数据不足”。"
+        "该报告只使用Top榜单和已补全的产品参数，不需要评论文件。详情补全越完整，"
+        "Vacmaster定价和能力差异结论越可靠。"
     )
-    reviews_key = f"{category_key}_reviews"
-    if reviews_file is not None:
-        try:
-            st.session_state[reviews_key] = normalize_reviews(read_uploaded_table(reviews_file))
-        except Exception as exc:
-            st.error(f"评论文件读取失败：{exc}")
-    reviews = st.session_state.get(reviews_key, pd.DataFrame(columns=REVIEW_TEMPLATE_COLUMNS))
-    if not reviews.empty:
-        st.dataframe(reviews.head(200), use_container_width=True, hide_index=True)
-
-    run_analysis = st.button(
-        "生成商业分析与 VOC 报告",
+    commercial_key = f"{category_key}_commercial_analysis"
+    if st.button(
+        "生成产品商业分析报告",
         type="primary",
-        key=f"{category_key}_analyze",
-    )
-    analysis_key = f"{category_key}_analysis"
-    if run_analysis:
+        key=f"{category_key}_commercial_run",
+    ):
         if products.empty:
-            st.warning("请先获取或上传产品数据。")
+            st.warning("请先获取Top榜单并尽量补全产品详情。")
         else:
-            local_voc = analyze_reviews(reviews, category_key)
-            config = settings_from_env(data_dir)
-            with st.spinner("正在生成结构化分析……"):
-                analysis = analyze_market(products, reviews, local_voc, category_key, config)
-            products = merge_sku_insights(products, analysis)
-            st.session_state[f"{category_key}_products"] = products
-            st.session_state[analysis_key] = analysis
+            with st.spinner("正在分析价格带、品牌基准、能力差异和Vacmaster机会……"):
+                st.session_state[commercial_key] = analyze_market(
+                    products,
+                    pd.DataFrame(),
+                    [],
+                    category_key,
+                    config,
+                )
 
-    analysis = st.session_state.get(analysis_key)
-    if analysis:
-        products = merge_sku_insights(products, analysis)
+    commercial = st.session_state.get(commercial_key)
+    if commercial:
         c1, c2, c3 = st.columns(3)
         c1.metric("产品数", len(products))
         c2.metric("品牌数", products["brand"].replace("", pd.NA).nunique())
-        c3.metric("评论数", len(reviews))
+        c3.metric(
+            "详情已补全",
+            int(products["detail_status"].isin(["成功", "部分成功"]).sum()),
+        )
         st.markdown("##### 市场格局")
-        st.write(analysis.get("market_landscape", "暂无结论"))
-        price_bands = analysis.get("price_band_analysis", [])
-        if price_bands:
+        st.write(commercial.get("market_landscape", "暂无结论"))
+        if commercial.get("price_band_analysis"):
             st.markdown("##### 价格带分析")
-            st.dataframe(pd.DataFrame(price_bands), use_container_width=True, hide_index=True)
-        brand_benchmark = analysis.get("brand_benchmark", [])
-        if brand_benchmark:
-            st.markdown("##### 品牌价格与能力基准")
             st.dataframe(
-                pd.DataFrame(brand_benchmark),
+                pd.DataFrame(commercial["price_band_analysis"]),
                 use_container_width=True,
                 hide_index=True,
             )
-        if analysis.get("vacmaster_positioning"):
-            st.markdown("##### Vacmaster 定价与能力定位")
-            positioning = analysis["vacmaster_positioning"]
+        if commercial.get("brand_benchmark"):
+            st.markdown("##### 品牌价格与能力基准")
+            st.dataframe(
+                pd.DataFrame(commercial["brand_benchmark"]),
+                use_container_width=True,
+                hide_index=True,
+            )
+        positioning = commercial.get("vacmaster_positioning")
+        if positioning:
+            st.markdown("##### Vacmaster定价与能力定位")
             if isinstance(positioning, dict):
                 st.dataframe(
                     pd.DataFrame(
@@ -439,38 +431,102 @@ def render_bsr_module(
                 )
             else:
                 st.write(positioning)
-        capability = analysis.get("capability_comparison", [])
-        if capability:
-            st.markdown("##### Vacmaster 与竞品能力差异")
-            st.dataframe(pd.DataFrame(capability), use_container_width=True, hide_index=True)
-        gaps = analysis.get("opportunity_gaps", [])
-        if gaps:
-            st.markdown("##### 产品与价格机会")
-            for item in gaps:
-                st.markdown(f"- {item}")
+        if commercial.get("capability_comparison"):
+            st.markdown("##### Vacmaster与竞品能力差异")
+            st.dataframe(
+                pd.DataFrame(commercial["capability_comparison"]),
+                use_container_width=True,
+                hide_index=True,
+            )
+        if commercial.get("brand_comparison"):
+            st.markdown("##### 品牌与技术路线")
+            st.write(commercial["brand_comparison"])
+        st.markdown("##### 产品机会与应对建议")
+        for item in commercial.get("opportunity_gaps", []):
+            st.markdown(f"- {item}")
+        for item in commercial.get("recommendations", []):
+            st.markdown(f"- {item}")
+        st.caption(f"分析方式：{commercial.get('analysis_mode', '本地规则')}")
+
+        previous = store.previous_snapshot(category_key, current=products)
+        d1, d2 = st.columns(2)
+        d1.download_button(
+            "下载商业分析 Excel",
+            build_bsr_workbook(
+                products,
+                pd.DataFrame(),
+                commercial,
+                previous,
+                title,
+            ),
+            f"{category_key}_commercial_{date.today():%Y%m%d}.xlsx",
+            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            key=f"{category_key}_commercial_excel",
+        )
+        d2.download_button(
+            "下载商业分析 HTML",
+            build_bsr_html(products, commercial, title),
+            f"{category_key}_commercial_{date.today():%Y%m%d}.html",
+            "text/html",
+            key=f"{category_key}_commercial_html",
+        )
+
+    st.markdown("#### 4. 评论与 VOC（独立分析）")
+    reviews_file = st.file_uploader(
+        "上传评论文件（可选）",
+        type=["csv", "xlsx", "xls"],
+        key=f"{category_key}_reviews_upload",
+        help="建议字段：ASIN、星级、评论标题、评论正文、评论日期。",
+    )
+    st.caption(
+        "VOC只分析上传的评论，不影响上面的产品商业报告。Amazon官方接口通常不能提供"
+        "所有竞品的完整评论正文，因此没有评论文件时不会调用DeepSeek生成VOC。"
+    )
+    reviews_key = f"{category_key}_reviews"
+    if reviews_file is not None:
+        try:
+            st.session_state[reviews_key] = normalize_reviews(read_uploaded_table(reviews_file))
+        except Exception as exc:
+            st.error(f"评论文件读取失败：{exc}")
+    reviews = st.session_state.get(reviews_key, pd.DataFrame(columns=REVIEW_TEMPLATE_COLUMNS))
+    if not reviews.empty:
+        st.dataframe(reviews.head(200), use_container_width=True, hide_index=True)
+    voc_key = f"{category_key}_voc_analysis"
+    if st.button(
+        "生成 VOC 报告",
+        key=f"{category_key}_voc_run",
+        disabled=reviews.empty,
+    ):
+        if not products.empty:
+            local_voc = analyze_reviews(reviews, category_key)
+            with st.spinner("正在分析低星痛点、高星卖点、使用场景和ASIN建议……"):
+                voc = analyze_voc_report(products, reviews, local_voc, category_key, config)
+            products = merge_sku_insights(products, voc)
+            st.session_state[f"{category_key}_products"] = products
+            st.session_state[voc_key] = voc
+
+    voc = st.session_state.get(voc_key)
+    if voc:
+        st.write(voc.get("voc_summary", ""))
         st.markdown("##### VOC 痛点")
-        pain_points = analysis.get("pain_points", [])
+        pain_points = voc.get("pain_points", [])
         if pain_points:
             st.dataframe(pd.DataFrame(pain_points), use_container_width=True, hide_index=True)
         else:
             st.caption("暂无足够评论生成痛点占比。")
         st.markdown("##### 好评核心卖点")
-        selling_points = analysis.get("selling_points", [])
+        selling_points = voc.get("selling_points", [])
         if selling_points:
             st.dataframe(pd.DataFrame(selling_points), use_container_width=True, hide_index=True)
         else:
             st.caption("暂无足够4-5星评论生成卖点。")
-        if analysis.get("brand_comparison"):
-            st.markdown("##### 品牌与技术对比")
-            st.write(analysis["brand_comparison"])
-        st.markdown("##### 对 Vacmaster 的建议")
-        for item in analysis.get("recommendations", []):
+        st.markdown("##### VOC改进建议")
+        for item in voc.get("recommendations", []):
             st.markdown(f"- {item}")
-        st.caption(f"分析方式：{analysis.get('analysis_mode', '本地规则')}")
+        st.caption(f"分析方式：{voc.get('analysis_mode', '本地规则')}")
 
-    st.markdown("#### 4. 保存与导出")
-    col1, col2 = st.columns(2)
-    if col1.button("保存本次快照", key=f"{category_key}_save"):
+    st.markdown("#### 5. 保存快照")
+    if st.button("保存本次快照", key=f"{category_key}_save"):
         if products.empty:
             st.warning("没有可保存的数据。")
         else:
@@ -481,22 +537,6 @@ def render_bsr_module(
                 source_url=url,
             )
             st.success("快照已保存。下次运行后可计算排名变化。")
-    if not products.empty:
-        previous = store.previous_snapshot(category_key, current=products)
-        export = build_bsr_workbook(
-            products=products,
-            reviews=reviews,
-            analysis=analysis or {},
-            previous_products=previous,
-            report_title=title,
-        )
-        col2.download_button(
-            "下载分析 Excel",
-            data=export,
-            file_name=f"{category_key}_{date.today():%Y%m%d}.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            key=f"{category_key}_download",
-        )
 
 
 def render_competitor_module(store: SnapshotStore) -> None:
@@ -511,6 +551,8 @@ def render_competitor_module(store: SnapshotStore) -> None:
             try:
                 result = collect_google_news(brands, max_per_brand=max_per_brand)
                 st.session_state[state_key] = result
+                st.session_state.pop("competitor_summary", None)
+                st.session_state.pop("competitor_analysis_mode", None)
                 st.success(f"获得 {len(result)} 条候选情报。")
             except Exception as exc:
                 st.error(f"本次搜集失败：{exc}")
@@ -521,6 +563,7 @@ def render_competitor_module(store: SnapshotStore) -> None:
         st.session_state[state_key] = normalize_intelligence_table(
             pd.concat([current, incoming], ignore_index=True)
         )
+        st.session_state.pop("competitor_summary", None)
 
     intel = st.session_state.get(state_key, pd.DataFrame(columns=INTEL_TEMPLATE_COLUMNS))
     if not intel.empty:
@@ -542,13 +585,24 @@ def render_competitor_module(store: SnapshotStore) -> None:
         )
         st.session_state[state_key] = intel
         config = settings_from_env(os.getenv("LOCAL_DATA_DIR", "data"))
+        analysis_limit = st.slider(
+            "本次使用DeepSeek分析多少条候选情报",
+            min_value=1,
+            max_value=min(80, len(intel)),
+            value=min(30, len(intel)),
+            help="候选信息较多时建议先分析最近30条，避免一次产生过多请求或触发接口限流。",
+        )
         if config.enabled:
-            if st.button("使用 DeepSeek 提取规格、策略与竞争影响", type="primary"):
-                with st.spinner("DeepSeek 正在分析竞品情报……"):
-                    intel, mode = enrich_competitor_intelligence(intel, config)
+            if st.button("DeepSeek分析并生成竞品报告", type="primary"):
+                with st.spinner("正在分批提取规格与策略，并形成CLEVA竞争影响报告……"):
+                    intel, mode = enrich_competitor_intelligence(
+                        intel, config, max_items=analysis_limit
+                    )
+                    summary = summarize_competitor_intelligence(intel, config)
                 st.session_state[state_key] = intel
                 st.session_state["competitor_analysis_mode"] = mode
-                st.rerun()
+                st.session_state["competitor_summary"] = summary
+                st.success("竞品明细和管理层摘要已生成。")
         else:
             st.warning("未配置 DeepSeek，当前只有关键词分类；规格、策略和竞争影响需人工填写。")
         st.caption(
@@ -561,7 +615,31 @@ def render_competitor_module(store: SnapshotStore) -> None:
     else:
         st.caption("尚无竞品情报。自动搜索失败时可上传人工收集的表格。")
 
-    c1, c2 = st.columns(2)
+    summary = st.session_state.get("competitor_summary")
+    if summary:
+        st.markdown("#### 2. 竞品情报分析报告")
+        st.markdown("##### 管理层摘要")
+        st.write(summary.get("executive_summary", "暂无"))
+        sections = [
+            ("核心技术规格与卖点", "core_technology_and_selling_points"),
+            ("定价与市场策略", "pricing_and_market_strategy"),
+            ("对CLEVA（Vacmaster/Lawnmaster）的竞争影响", "competitive_impact_on_cleva"),
+            ("应对方案", "response_plan"),
+            ("重点关注清单", "priority_watchlist"),
+        ]
+        for heading, key in sections:
+            st.markdown(f"##### {heading}")
+            values = summary.get(key, [])
+            if not isinstance(values, list):
+                values = [values] if values else []
+            if values:
+                for value in values:
+                    st.markdown(f"- {value}")
+            else:
+                st.caption("当前信息不足，需补充来源或人工判断。")
+        st.caption(f"汇总方式：{summary.get('analysis_mode', '本地汇总')}")
+
+    c1, c2, c3 = st.columns(3)
     if c1.button("保存本周情报"):
         if intel.empty:
             st.warning("没有可保存的数据。")
@@ -571,10 +649,17 @@ def render_competitor_module(store: SnapshotStore) -> None:
     if not intel.empty:
         c2.download_button(
             "下载竞品情报 Excel",
-            build_competitor_workbook(intel),
+            build_competitor_workbook(intel, summary),
             f"competitor_intelligence_{date.today():%Y%m%d}.xlsx",
             "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         )
+        if summary:
+            c3.download_button(
+                "下载竞品情报 HTML",
+                build_competitor_html(intel, summary),
+                f"competitor_intelligence_{date.today():%Y%m%d}.html",
+                "text/html",
+            )
 
 
 def render_sales_module(store: SnapshotStore) -> None:

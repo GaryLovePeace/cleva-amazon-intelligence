@@ -3,8 +3,10 @@ from __future__ import annotations
 import json
 import os
 import re
+import time
 from dataclasses import dataclass
 from pathlib import Path
+from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
 import pandas as pd
@@ -241,8 +243,18 @@ def _call_json(settings: LLMSettings, messages: list[dict]) -> dict:
             "Content-Type": "application/json",
         },
     )
-    with urlopen(request, timeout=60) as response:
-        body = json.loads(response.read().decode("utf-8"))
+    try:
+        with urlopen(request, timeout=90) as response:
+            body = json.loads(response.read().decode("utf-8"))
+    except HTTPError as exc:
+        try:
+            error_body = exc.read().decode("utf-8", errors="replace")[:500]
+        except Exception:
+            error_body = ""
+        raise RuntimeError(
+            f"模型接口返回 HTTP {exc.code}"
+            + (f"：{error_body}" if error_body else "")
+        ) from exc
     return _parse_json_content(body["choices"][0]["message"]["content"])
 
 
@@ -288,18 +300,11 @@ def analyze_market(
     if not settings.enabled:
         return fallback
     product_records = _safe_records(products, 50)
-    review_records = _safe_records(reviews, 400)
     prompt = {
         "category": category_key,
         "products": product_records,
-        "reviews": review_records,
-        "rule_based_voc": local_voc,
         "required_schema": {
             "market_landscape": "string",
-            "pain_points": [{"pain_point": "string", "mentions": 0, "mention_rate": 0.0}],
-            "selling_points": [
-                {"selling_point": "string", "mentions": 0, "mention_rate": 0.0}
-            ],
             "brand_comparison": "string，spot_cleaner品类必须比较美系与中国出海品牌",
             "price_band_analysis": fallback["price_band_analysis"],
             "brand_benchmark": fallback["brand_benchmark"],
@@ -320,16 +325,6 @@ def analyze_market(
                 }
             ],
             "opportunity_gaps": ["string"],
-            "sku_insights": [
-                {
-                    "asin": "string",
-                    "pain_points": ["string"],
-                    "selling_points": ["string"],
-                    "use_scenarios": ["string"],
-                    "differentiation_recommendation": "string",
-                    "confidence": "high|medium|low",
-                }
-            ],
             "recommendations": ["string"],
         },
     }
@@ -341,13 +336,12 @@ def analyze_market(
                     "role": "system",
                     "content": (
                         "你是CLEVA市场情报分析师。只根据输入数据作答，不得捏造销量、份额或规格。"
-                        "区分1-3星痛点与4-5星卖点，输出严格JSON。"
                         "必须重点比较Vacmaster与同价格带竞品的定价、容量、马力/吸力、"
                         "配件、过滤、保修和功能差异；缺失字段必须写明数据不足。"
                         "spot_cleaner必须分析Bissell/Hoover等美系品牌与"
                         "Tineco/UWANT/Dreame等中国出海品牌的技术差异。"
                         "不能把bought_past_month当作真实销量或市场份额。"
-                        "sku_insights只能引用输入中存在的ASIN。建议应具体、可执行，并明确估算数据。"
+                        "建议应具体、可执行，并明确估算数据。只输出严格JSON。"
                     ),
                 },
                 {
@@ -361,10 +355,103 @@ def analyze_market(
         result.setdefault("vacmaster_positioning", fallback["vacmaster_positioning"])
         result.setdefault("capability_comparison", [])
         result.setdefault("opportunity_gaps", fallback["opportunity_gaps"])
+        result.setdefault("pain_points", [])
+        result.setdefault("selling_points", [])
+        result.setdefault("sku_insights", [])
         result["analysis_mode"] = f"大模型：{settings.model}"
         return result
     except Exception as exc:
-        fallback["analysis_mode"] += f"；大模型调用失败，已自动回退：{type(exc).__name__}"
+        fallback["analysis_mode"] += f"；大模型调用失败：{str(exc)[:180]}"
+        return fallback
+
+
+def analyze_voc_report(
+    products: pd.DataFrame,
+    reviews: pd.DataFrame,
+    local_voc: list[dict],
+    category_key: str,
+    settings: LLMSettings,
+) -> dict:
+    """Analyze uploaded reviews independently from the product commercial report."""
+    fallback = {
+        "pain_points": local_voc,
+        "selling_points": [],
+        "sku_insights": [],
+        "voc_summary": (
+            "未上传有效评论，无法生成VOC。"
+            if reviews.empty
+            else f"已读取{len(reviews)}条评论；当前使用本地关键词规则。"
+        ),
+        "recommendations": [],
+        "analysis_mode": "本地规则（未调用外部大模型）",
+    }
+    if reviews.empty or not settings.enabled:
+        return fallback
+    product_fields = [
+        field for field in ["asin", "brand", "title", "model", "price"] if field in products
+    ]
+    try:
+        result = _call_json(
+            settings,
+            [
+                {
+                    "role": "system",
+                    "content": (
+                        "你是CLEVA消费者洞察分析师。只分析输入评论。区分1-3星痛点和"
+                        "4-5星卖点，按ASIN归纳场景与建议。无证据时写数据不足，只输出JSON。"
+                    ),
+                },
+                {
+                    "role": "user",
+                    "content": json.dumps(
+                        {
+                            "category": category_key,
+                            "products": _safe_records(
+                                products[product_fields], 50, text_limit=300
+                            ),
+                            "reviews": _safe_records(reviews, 500, text_limit=800),
+                            "rule_based_voc": local_voc,
+                            "required_schema": {
+                                "voc_summary": "string",
+                                "pain_points": [
+                                    {
+                                        "pain_point": "string",
+                                        "mentions": 0,
+                                        "mention_rate": 0.0,
+                                        "evidence": "string",
+                                    }
+                                ],
+                                "selling_points": [
+                                    {
+                                        "selling_point": "string",
+                                        "mentions": 0,
+                                        "mention_rate": 0.0,
+                                        "evidence": "string",
+                                    }
+                                ],
+                                "sku_insights": [
+                                    {
+                                        "asin": "string",
+                                        "pain_points": ["string"],
+                                        "selling_points": ["string"],
+                                        "use_scenarios": ["string"],
+                                        "differentiation_recommendation": "string",
+                                        "confidence": "high|medium|low",
+                                    }
+                                ],
+                                "recommendations": ["string"],
+                            },
+                        },
+                        ensure_ascii=False,
+                        default=str,
+                    ),
+                },
+            ],
+        )
+        result["analysis_mode"] = f"大模型：{settings.model}"
+        return result
+    except Exception as exc:
+        fallback["analysis_mode"] += f"；大模型调用失败：{str(exc)[:180]}"
         return fallback
 
 
@@ -412,7 +499,7 @@ def merge_sku_insights(products: pd.DataFrame, analysis: dict) -> pd.DataFrame:
 
 
 def enrich_competitor_intelligence(
-    intelligence: pd.DataFrame, settings: LLMSettings
+    intelligence: pd.DataFrame, settings: LLMSettings, max_items: int = 60
 ) -> tuple[pd.DataFrame, str]:
     result = intelligence.copy().reset_index(drop=True)
     for column in [
@@ -426,72 +513,215 @@ def enrich_competitor_intelligence(
     if result.empty or not settings.enabled:
         return result, "本地规则（未调用外部大模型）"
 
-    records = _safe_records(result, len(result))
-    for row_id, record in enumerate(records):
-        record["_row_id"] = row_id
-    try:
-        updates: list[dict] = []
-        for batch in _chunks(records, 12):
-            payload = {
-                "items": batch,
-                "required_schema": {
-                    "items": [
-                        {
-                            "_row_id": 0,
-                            "category": "string",
-                            "product_name": "string",
-                            "model": "string",
-                            "status": "Active Sales|Pre-order|Teaser|Leak|待判断",
-                            "core_specs": "string",
-                            "price_strategy": "string",
-                            "competitive_impact": "string",
-                            "recommended_action": "string",
-                            "summary": "string",
-                            "confidence": "高|中|低",
-                        }
-                    ]
+    target_indices = result.index.tolist()[: max(1, min(max_items, len(result)))]
+    target = result.loc[target_indices]
+    selected_columns = [
+        column
+        for column in [
+            "discovered_at",
+            "region",
+            "brand",
+            "category",
+            "product_name",
+            "status",
+            "source_title",
+            "source_summary",
+            "source_url",
+        ]
+        if column in target
+    ]
+    records = _safe_records(target[selected_columns], len(target), text_limit=500)
+    for record, row_id in zip(records, target_indices):
+        record["_row_id"] = int(row_id)
+
+    def analyze_batch(batch: list[dict]) -> list[dict]:
+        payload = {
+            "items": batch,
+            "required_schema": {
+                "items": [
+                    {
+                        "_row_id": 0,
+                        "category": "string",
+                        "product_name": "string",
+                        "model": "string",
+                        "status": "Active Sales|Pre-order|Teaser|Leak|待判断",
+                        "core_specs": "string",
+                        "price_strategy": "string",
+                        "competitive_impact": "string",
+                        "recommended_action": "string",
+                        "summary": "string",
+                        "confidence": "高|中|低",
+                    }
+                ]
+            },
+        }
+        response = _call_json(
+            settings,
+            [
+                {
+                    "role": "system",
+                    "content": (
+                        "你是CLEVA全球竞品情报分析师。仅依据标题、摘要和来源字段提取信息，"
+                        "不得猜测不存在的型号、价格或规格。明确分析对Vacmaster或Lawnmaster"
+                        "的竞争影响与动作；证据不足则留空。输出严格JSON。"
+                    ),
                 },
-            }
-            response = _call_json(
-                settings,
-                [
-                    {
-                        "role": "system",
-                        "content": (
-                            "你是CLEVA全球竞品情报分析师。仅依据标题、摘要和来源字段提取信息，"
-                            "不得猜测不存在的型号、价格或规格。缺失字段留空。输出严格JSON。"
-                        ),
-                    },
-                    {
-                        "role": "user",
-                        "content": json.dumps(payload, ensure_ascii=False, default=str),
-                    },
-                ],
-            )
-            updates.extend(response.get("items", []) or [])
-        for item in updates:
-            row_id = item.get("_row_id")
-            if not isinstance(row_id, int) or not 0 <= row_id < len(result):
-                continue
-            mapping = {
-                "category": "category",
-                "product_name": "product_name",
-                "model": "model",
-                "status": "status",
-                "core_specs": "core_specs",
-                "price_strategy": "price_strategy",
-                "competitive_impact": "competitive_impact",
-                "recommended_action": "recommended_action",
-                "summary": "llm_summary",
-                "confidence": "llm_confidence",
-            }
-            for source, target in mapping.items():
-                value = item.get(source)
-                if value not in (None, ""):
-                    result.at[row_id, target] = value
-        return result, f"大模型：{settings.model}"
+                {
+                    "role": "user",
+                    "content": json.dumps(payload, ensure_ascii=False, default=str),
+                },
+            ],
+        )
+        return response.get("items", []) or []
+
+    updates: list[dict] = []
+    failures: list[str] = []
+    for batch_number, batch in enumerate(_chunks(records, 6), start=1):
+        try:
+            updates.extend(analyze_batch(batch))
+        except Exception as exc:
+            # A large or rate-limited batch should not discard successful earlier batches.
+            recovered = False
+            if len(batch) > 1:
+                for smaller in _chunks(batch, 3):
+                    try:
+                        time.sleep(0.4)
+                        updates.extend(analyze_batch(smaller))
+                        recovered = True
+                    except Exception as smaller_exc:
+                        failures.append(f"批次{batch_number}: {str(smaller_exc)[:120]}")
+            if not recovered:
+                failures.append(f"批次{batch_number}: {str(exc)[:120]}")
+        time.sleep(0.15)
+
+    mapping = {
+        "category": "category",
+        "product_name": "product_name",
+        "model": "model",
+        "status": "status",
+        "core_specs": "core_specs",
+        "price_strategy": "price_strategy",
+        "competitive_impact": "competitive_impact",
+        "recommended_action": "recommended_action",
+        "summary": "llm_summary",
+        "confidence": "llm_confidence",
+    }
+    for item in updates:
+        row_id = item.get("_row_id")
+        if not isinstance(row_id, int) or not 0 <= row_id < len(result):
+            continue
+        for source, target_column in mapping.items():
+            value = item.get(source)
+            if value not in (None, ""):
+                result.at[row_id, target_column] = value
+    successful_rows = int(
+        result.loc[target_indices, "llm_summary"].fillna("").astype(str).str.strip().ne("").sum()
+    )
+    if failures:
+        return (
+            result,
+            f"大模型部分完成：{successful_rows}/{len(target_indices)}条；"
+            f"{len(failures)}个小批次失败。可减少分析条数后重试。",
+        )
+    return result, f"大模型：{settings.model}（完成{successful_rows}/{len(target_indices)}条）"
+
+
+def summarize_competitor_intelligence(
+    intelligence: pd.DataFrame, settings: LLMSettings
+) -> dict:
+    """Create an executive competitor report for Vacmaster and Lawnmaster."""
+    data = intelligence.copy()
+    brand_counts = (
+        data["brand"].replace("", pd.NA).dropna().value_counts().head(8).to_dict()
+        if "brand" in data
+        else {}
+    )
+    category_counts = (
+        data["category"].replace("", pd.NA).dropna().value_counts().head(8).to_dict()
+        if "category" in data
+        else {}
+    )
+
+    def unique_values(column: str, limit: int = 10) -> list[str]:
+        if column not in data:
+            return []
+        values = data[column].fillna("").astype(str).str.strip()
+        return [value for value in values.drop_duplicates() if value][:limit]
+
+    fallback = {
+        "executive_summary": (
+            f"本期共{len(data)}条候选情报，涉及{len(brand_counts)}个主要品牌。"
+            "以下为已提取字段汇总，仍需结合原始来源人工复核。"
+        ),
+        "core_technology_and_selling_points": unique_values("core_specs"),
+        "pricing_and_market_strategy": unique_values("price_strategy"),
+        "competitive_impact_on_cleva": unique_values("competitive_impact"),
+        "response_plan": unique_values("recommended_action"),
+        "priority_watchlist": unique_values("llm_summary", 8),
+        "brand_distribution": brand_counts,
+        "category_distribution": category_counts,
+        "analysis_mode": "本地汇总（未调用外部大模型）",
+    }
+    if data.empty or not settings.enabled:
+        return fallback
+    fields = [
+        field
+        for field in [
+            "discovered_at",
+            "brand",
+            "category",
+            "product_name",
+            "model",
+            "status",
+            "core_specs",
+            "price_strategy",
+            "competitive_impact",
+            "recommended_action",
+            "llm_summary",
+            "source_url",
+        ]
+        if field in data
+    ]
+    compressed = _safe_records(data[fields], 60, text_limit=350)
+    try:
+        summary = _call_json(
+            settings,
+            [
+                {
+                    "role": "system",
+                    "content": (
+                        "你是CLEVA战略情报负责人。根据候选情报形成管理层报告，重点覆盖"
+                        "核心技术规格与卖点、定价与市场策略、对Vacmaster和Lawnmaster的"
+                        "竞争影响及分优先级应对方案。不得补造输入中没有的事实，只输出JSON。"
+                    ),
+                },
+                {
+                    "role": "user",
+                    "content": json.dumps(
+                        {
+                            "items": compressed,
+                            "required_schema": {
+                                "executive_summary": "string",
+                                "core_technology_and_selling_points": ["string"],
+                                "pricing_and_market_strategy": ["string"],
+                                "competitive_impact_on_cleva": ["string"],
+                                "response_plan": ["string"],
+                                "priority_watchlist": ["string"],
+                            },
+                        },
+                        ensure_ascii=False,
+                        default=str,
+                    ),
+                },
+            ],
+        )
+        summary.setdefault("brand_distribution", brand_counts)
+        summary.setdefault("category_distribution", category_counts)
+        summary["analysis_mode"] = f"大模型：{settings.model}"
+        return summary
     except Exception as exc:
-        return result, f"DeepSeek调用失败，保留原始数据：{type(exc).__name__}"
+        fallback["analysis_mode"] += f"；大模型汇总失败：{str(exc)[:160]}"
+        return fallback
 
 
 def enrich_sales_diagnostics(
