@@ -8,7 +8,11 @@ from pathlib import Path
 import pandas as pd
 import streamlit as st
 
-from core.amazon import fetch_bestseller_products, normalize_product_table
+from core.amazon import (
+    enrich_product_details_browser,
+    fetch_bestseller_products,
+    normalize_product_table,
+)
 from core.competitor import DEFAULT_BRANDS, collect_google_news, normalize_intelligence_table
 from core.llm import (
     LLMSettings,
@@ -49,12 +53,32 @@ PRODUCT_TEMPLATE_COLUMNS = [
     "review_count",
     "bought_past_month",
     "product_url",
+    "image_url",
+    "list_price",
+    "discount_percent",
+    "availability",
     "model",
     "capacity",
     "horsepower",
+    "airflow",
+    "suction",
+    "power",
+    "weight",
+    "dimensions",
+    "hose_length",
+    "cord_length",
+    "filtration",
+    "tank_material",
     "clean_tank_capacity",
     "dirty_tank_capacity",
     "heating_or_steam",
+    "accessories",
+    "warranty",
+    "special_features",
+    "bullet_points",
+    "specifications",
+    "detail_status",
+    "detail_collected_at",
 ]
 REVIEW_TEMPLATE_COLUMNS = ["asin", "rating", "review_title", "review_text", "review_date"]
 INTEL_TEMPLATE_COLUMNS = [
@@ -257,11 +281,66 @@ def product_source_panel(category_key: str, url: str) -> pd.DataFrame:
     products = st.session_state.get(state_key, pd.DataFrame(columns=PRODUCT_TEMPLATE_COLUMNS))
     if not products.empty:
         products = normalize_product_table(products)
+        st.markdown("#### 2. 补全产品详情与商业参数")
+        detail_success = int(products["detail_status"].isin(["成功", "部分成功"]).sum())
+        c1, c2, c3 = st.columns(3)
+        c1.metric("Top榜单产品", len(products))
+        c2.metric("已补全详情", detail_success)
+        c3.metric("待补全", max(len(products) - detail_success, 0))
+        detail_limit = st.slider(
+            "本次补全多少个产品详情页",
+            min_value=1,
+            max_value=len(products),
+            value=min(10, len(products)),
+            key=f"{category_key}_detail_limit",
+            help="建议先测试10个；完整补全Top 50耗时更长，也更容易触发Amazon验证码。",
+        )
+        st.caption(
+            "详情采集会逐一访问ASIN页面，提取型号、容量、马力/吸力、功率、尺寸、"
+            "软管、电源线、过滤、配件、保修和Spot Cleaner水箱/蒸汽等字段。"
+        )
+        if st.button(
+            "采集并补全产品详情",
+            type="primary",
+            key=f"{category_key}_detail_fetch",
+        ):
+            progress = st.progress(0, text="准备打开产品详情页……")
+
+            def update_detail_progress(current: int, total: int, label: str) -> None:
+                progress.progress(
+                    min(current / max(total, 1), 1.0),
+                    text=f"正在补全 {current}/{total}：{label}",
+                )
+
+            try:
+                result = enrich_product_details_browser(
+                    products,
+                    max_products=detail_limit,
+                    on_progress=update_detail_progress,
+                )
+                products = result.data
+                st.session_state[state_key] = products
+                progress.progress(1.0, text="详情补全完成")
+                for warning in result.warnings:
+                    st.warning(warning)
+                completed = int(products["detail_status"].isin(["成功", "部分成功"]).sum())
+                st.success(f"当前已补全 {completed}/{len(products)} 个产品详情。")
+                st.rerun()
+            except Exception as exc:
+                progress.empty()
+                st.error(f"详情补全未完成：{exc}")
         edited = st.data_editor(
             products,
             use_container_width=True,
             hide_index=True,
             num_rows="dynamic",
+            column_config={
+                "product_url": st.column_config.LinkColumn("Amazon链接"),
+                "image_url": st.column_config.ImageColumn("产品主图"),
+                "price": st.column_config.NumberColumn("当前价格", format="$%.2f"),
+                "list_price": st.column_config.NumberColumn("原价", format="$%.2f"),
+                "discount_percent": st.column_config.NumberColumn("折扣率", format="%.1f%%"),
+            },
             key=f"{category_key}_editor",
         )
         st.session_state[state_key] = edited
@@ -281,7 +360,7 @@ def render_bsr_module(
     hero(title, subtitle)
     products = product_source_panel(category_key, url)
 
-    st.markdown("#### 2. 评论与 VOC")
+    st.markdown("#### 3. 评论与 VOC、定价和能力分析")
     data_dir = os.getenv("LOCAL_DATA_DIR", "data")
     llm_config = settings_from_env(data_dir)
     if llm_config.enabled:
@@ -294,6 +373,10 @@ def render_bsr_module(
         key=f"{category_key}_reviews_upload",
         help="建议字段：ASIN、星级、评论标题、评论正文、评论日期。",
     )
+    st.caption(
+        "Amazon官方接口通常不能提供所有竞品的完整评论正文。没有评论文件时仍可生成"
+        "价格和能力分析；VOC部分会明确标记为“评论数据不足”。"
+    )
     reviews_key = f"{category_key}_reviews"
     if reviews_file is not None:
         try:
@@ -304,7 +387,11 @@ def render_bsr_module(
     if not reviews.empty:
         st.dataframe(reviews.head(200), use_container_width=True, hide_index=True)
 
-    run_analysis = st.button("生成 VOC 与市场建议", key=f"{category_key}_analyze")
+    run_analysis = st.button(
+        "生成商业分析与 VOC 报告",
+        type="primary",
+        key=f"{category_key}_analyze",
+    )
     analysis_key = f"{category_key}_analysis"
     if run_analysis:
         if products.empty:
@@ -327,6 +414,40 @@ def render_bsr_module(
         c3.metric("评论数", len(reviews))
         st.markdown("##### 市场格局")
         st.write(analysis.get("market_landscape", "暂无结论"))
+        price_bands = analysis.get("price_band_analysis", [])
+        if price_bands:
+            st.markdown("##### 价格带分析")
+            st.dataframe(pd.DataFrame(price_bands), use_container_width=True, hide_index=True)
+        brand_benchmark = analysis.get("brand_benchmark", [])
+        if brand_benchmark:
+            st.markdown("##### 品牌价格与能力基准")
+            st.dataframe(
+                pd.DataFrame(brand_benchmark),
+                use_container_width=True,
+                hide_index=True,
+            )
+        if analysis.get("vacmaster_positioning"):
+            st.markdown("##### Vacmaster 定价与能力定位")
+            positioning = analysis["vacmaster_positioning"]
+            if isinstance(positioning, dict):
+                st.dataframe(
+                    pd.DataFrame(
+                        [{"分析项": key, "结论": value} for key, value in positioning.items()]
+                    ),
+                    use_container_width=True,
+                    hide_index=True,
+                )
+            else:
+                st.write(positioning)
+        capability = analysis.get("capability_comparison", [])
+        if capability:
+            st.markdown("##### Vacmaster 与竞品能力差异")
+            st.dataframe(pd.DataFrame(capability), use_container_width=True, hide_index=True)
+        gaps = analysis.get("opportunity_gaps", [])
+        if gaps:
+            st.markdown("##### 产品与价格机会")
+            for item in gaps:
+                st.markdown(f"- {item}")
         st.markdown("##### VOC 痛点")
         pain_points = analysis.get("pain_points", [])
         if pain_points:
@@ -347,7 +468,7 @@ def render_bsr_module(
             st.markdown(f"- {item}")
         st.caption(f"分析方式：{analysis.get('analysis_mode', '本地规则')}")
 
-    st.markdown("#### 3. 保存与导出")
+    st.markdown("#### 4. 保存与导出")
     col1, col2 = st.columns(2)
     if col1.button("保存本次快照", key=f"{category_key}_save"):
         if products.empty:

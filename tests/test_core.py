@@ -1,12 +1,14 @@
+import importlib.util
 import tempfile
 import unittest
 from unittest.mock import patch
 
 import pandas as pd
 
-from core.amazon import normalize_product_table
+from core.amazon import normalize_product_table, parse_product_detail_html
 from core.llm import (
     LLMSettings,
+    analyze_market,
     enrich_competitor_intelligence,
     enrich_sales_diagnostics,
     merge_sku_insights,
@@ -27,6 +29,75 @@ class CoreTests(unittest.TestCase):
         self.assertEqual(result.loc[0, "rank"], 2)
         self.assertEqual(result.loc[0, "price"], 99.99)
         self.assertEqual(result.loc[0, "brand"], "Vacmaster")
+
+    @unittest.skipUnless(importlib.util.find_spec("bs4"), "beautifulsoup4 not installed")
+    def test_product_detail_parser(self):
+        html = """
+        <html><body>
+          <span id="productTitle">Vacmaster 5 Gallon Wet Dry Vacuum</span>
+          <a id="bylineInfo">Visit the Vacmaster Store</a>
+          <div id="corePrice_feature_div"><span class="a-price">
+            <span class="a-offscreen">$79.99</span>
+          </span></div>
+          <div id="feature-bullets"><ul>
+            <li><span class="a-list-item">5 gallon tank and 5.5 peak HP motor</span></li>
+            <li><span class="a-list-item">Includes floor nozzle and crevice tool</span></li>
+          </ul></div>
+          <table id="productDetails_techSpec_section_1">
+            <tr><th>Item model number</th><td>VOC507PF</td></tr>
+            <tr><th>Item Weight</th><td>15 pounds</td></tr>
+            <tr><th>Hose Length</th><td>7 Feet</td></tr>
+            <tr><th>Warranty</th><td>2 years</td></tr>
+          </table>
+        </body></html>
+        """
+        detail = parse_product_detail_html(
+            html,
+            asin="B012345678",
+            product_url="https://www.amazon.com/dp/B012345678",
+        )
+        self.assertEqual(detail["brand"], "Vacmaster")
+        self.assertEqual(detail["model"], "VOC507PF")
+        self.assertEqual(detail["price"], 79.99)
+        self.assertIn("5 gallon", detail["capacity"].lower())
+        self.assertIn("5.5 peak hp", detail["horsepower"].lower())
+        self.assertEqual(detail["detail_status"], "成功")
+
+    def test_local_commercial_analysis(self):
+        products = normalize_product_table(
+            pd.DataFrame(
+                [
+                    {
+                        "rank": 1,
+                        "asin": "B000000001",
+                        "brand": "Vacmaster",
+                        "price": 79.99,
+                        "capacity": "5 gallon",
+                        "horsepower": "5.5 peak HP",
+                        "detail_status": "成功",
+                    },
+                    {
+                        "rank": 2,
+                        "asin": "B000000002",
+                        "brand": "Craftsman",
+                        "price": 99.99,
+                        "capacity": "6 gallon",
+                        "horsepower": "5 peak HP",
+                        "detail_status": "成功",
+                    },
+                ]
+            )
+        )
+        analysis = analyze_market(
+            products,
+            pd.DataFrame(),
+            [],
+            "wet_dry",
+            LLMSettings("", "https://api.deepseek.com", "model"),
+        )
+        self.assertTrue(analysis["price_band_analysis"])
+        self.assertTrue(analysis["brand_benchmark"])
+        self.assertIn("价格定位", analysis["vacmaster_positioning"])
 
     def test_voc(self):
         reviews = normalize_reviews(
@@ -126,6 +197,19 @@ class CoreTests(unittest.TestCase):
         )
         self.assertEqual(result.loc[0, "llm_selling_points"], "吸力强")
         self.assertEqual(result.loc[0, "llm_differentiation"], "加强软管")
+        repeated = merge_sku_insights(
+            result,
+            {
+                "sku_insights": [
+                    {
+                        "asin": "B012345678",
+                        "selling_points": ["更新后的卖点"],
+                    }
+                ]
+            },
+        )
+        self.assertEqual(repeated.loc[0, "llm_selling_points"], "更新后的卖点")
+        self.assertFalse(any(column.endswith("_x") for column in repeated.columns))
 
     @patch("core.llm._call_json")
     def test_competitor_deepseek_enrichment(self, mocked_call):

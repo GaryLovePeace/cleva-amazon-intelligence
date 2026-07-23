@@ -86,6 +86,38 @@ def _local_analysis(
     ]
     if category_key == "spot_cleaner":
         recommendations.insert(0, "重点验证软管耐久、水箱密封、抽取残水与管道自清洁能力。")
+    price_band_analysis = _build_price_band_analysis(products, category_key)
+    brand_benchmark = _build_brand_benchmark(products)
+    vacmaster = products[
+        products["brand"].fillna("").astype(str).str.contains("vacmaster", case=False)
+    ]
+    competitors = products.drop(vacmaster.index)
+    vacmaster_price = vacmaster["price"].dropna().mean() if not vacmaster.empty else None
+    competitor_price = (
+        competitors["price"].dropna().mean() if not competitors.empty else None
+    )
+    if vacmaster.empty:
+        vacmaster_positioning = {
+            "样本覆盖": "当前Top样本中未识别到Vacmaster，无法做品牌级定价结论。",
+            "后续动作": "检查品牌字段或补充Vacmaster目标ASIN后重新分析。",
+        }
+    else:
+        price_sentence = "价格数据不足"
+        if pd.notna(vacmaster_price) and pd.notna(competitor_price) and competitor_price:
+            difference = (vacmaster_price - competitor_price) / competitor_price
+            price_sentence = (
+                f"Vacmaster样本均价约${vacmaster_price:.2f}，"
+                f"较其他品牌样本均价{'高' if difference > 0 else '低'}{abs(difference):.1%}。"
+            )
+        vacmaster_positioning = {
+            "样本覆盖": f"识别到{len(vacmaster)}款Vacmaster产品。",
+            "价格定位": price_sentence,
+            "能力数据完整度": (
+                f"{int(vacmaster['detail_status'].isin(['成功', '部分成功']).sum())}/"
+                f"{len(vacmaster)}款已补全详情。"
+            ),
+            "结论边界": "本地结论基于当前Top榜单页面字段，不代表真实市场份额或销量。",
+        }
     return {
         "market_landscape": (
             f"当前样本包含 {len(products)} 款{category_name}。"
@@ -94,10 +126,93 @@ def _local_analysis(
         "pain_points": local_voc,
         "selling_points": [],
         "brand_comparison": "",
+        "price_band_analysis": price_band_analysis,
+        "brand_benchmark": brand_benchmark,
+        "vacmaster_positioning": vacmaster_positioning,
+        "capability_comparison": [],
+        "opportunity_gaps": [
+            "优先补全Top产品详情参数后，再识别同价格带的功能缺口。",
+            "将Vacmaster目标ASIN与同容量、同马力或同清洁方式产品进行一对一比较。",
+        ],
         "sku_insights": [],
         "recommendations": recommendations,
         "analysis_mode": "本地规则（未调用外部大模型）",
     }
+
+
+def _build_price_band_analysis(products: pd.DataFrame, category_key: str) -> list[dict]:
+    if products.empty or "price" not in products:
+        return []
+    data = products.copy()
+    data["price"] = pd.to_numeric(data["price"], errors="coerce")
+    data = data.dropna(subset=["price"])
+    if data.empty:
+        return []
+    if category_key == "spot_cleaner":
+        bins = [-float("inf"), 99.99, 149.99, 199.99, float("inf")]
+        labels = ["<$100", "$100–149", "$150–199", "$200+"]
+    else:
+        bins = [-float("inf"), 59.99, 99.99, 149.99, float("inf")]
+        labels = ["<$60", "$60–99", "$100–149", "$150+"]
+    data["price_band"] = pd.cut(data["price"], bins=bins, labels=labels)
+    data["is_vacmaster"] = data["brand"].fillna("").astype(str).str.contains(
+        "vacmaster", case=False
+    )
+    rows = []
+    for label in labels:
+        group = data[data["price_band"] == label]
+        if group.empty:
+            continue
+        rows.append(
+            {
+                "price_band": label,
+                "sku_count": int(len(group)),
+                "share_of_sample": round(len(group) / len(data) * 100, 1),
+                "average_price": round(float(group["price"].mean()), 2),
+                "vacmaster_sku_count": int(group["is_vacmaster"].sum()),
+                "top_brands": "、".join(
+                    group["brand"].replace("", pd.NA).dropna().value_counts().head(3).index
+                ),
+            }
+        )
+    return rows
+
+
+def _build_brand_benchmark(products: pd.DataFrame) -> list[dict]:
+    if products.empty or "brand" not in products:
+        return []
+    data = products.copy()
+    data["brand"] = data["brand"].fillna("").astype(str).str.strip()
+    data = data[data["brand"] != ""]
+    if data.empty:
+        return []
+    rows = []
+    for brand, group in data.groupby("brand", sort=False):
+        price = pd.to_numeric(group["price"], errors="coerce")
+        rating = pd.to_numeric(group["rating"], errors="coerce")
+        rank = pd.to_numeric(group["rank"], errors="coerce")
+        reviews = pd.to_numeric(group["review_count"], errors="coerce")
+        detail_coverage = (
+            group["detail_status"].isin(["成功", "部分成功"]).mean() * 100
+            if "detail_status" in group
+            else 0
+        )
+        rows.append(
+            {
+                "brand": brand,
+                "sku_count": int(len(group)),
+                "average_price": round(float(price.mean()), 2) if price.notna().any() else None,
+                "average_rank": round(float(rank.mean()), 1) if rank.notna().any() else None,
+                "average_rating": round(float(rating.mean()), 2)
+                if rating.notna().any()
+                else None,
+                "average_review_count": round(float(reviews.mean()), 0)
+                if reviews.notna().any()
+                else None,
+                "detail_coverage_percent": round(float(detail_coverage), 1),
+            }
+        )
+    return sorted(rows, key=lambda row: (-row["sku_count"], row["brand"]))[:15]
 
 
 def _parse_json_content(content: str) -> dict:
@@ -186,6 +301,25 @@ def analyze_market(
                 {"selling_point": "string", "mentions": 0, "mention_rate": 0.0}
             ],
             "brand_comparison": "string，spot_cleaner品类必须比较美系与中国出海品牌",
+            "price_band_analysis": fallback["price_band_analysis"],
+            "brand_benchmark": fallback["brand_benchmark"],
+            "vacmaster_positioning": {
+                "price_position": "string",
+                "capability_position": "string",
+                "strengths": ["string"],
+                "weaknesses": ["string"],
+                "evidence": ["string"],
+            },
+            "capability_comparison": [
+                {
+                    "dimension": "容量/马力/吸力/水箱/蒸汽/配件/保修等",
+                    "vacmaster": "string",
+                    "competitors": "string",
+                    "commercial_implication": "string",
+                    "evidence_level": "high|medium|low",
+                }
+            ],
+            "opportunity_gaps": ["string"],
             "sku_insights": [
                 {
                     "asin": "string",
@@ -208,8 +342,11 @@ def analyze_market(
                     "content": (
                         "你是CLEVA市场情报分析师。只根据输入数据作答，不得捏造销量、份额或规格。"
                         "区分1-3星痛点与4-5星卖点，输出严格JSON。"
+                        "必须重点比较Vacmaster与同价格带竞品的定价、容量、马力/吸力、"
+                        "配件、过滤、保修和功能差异；缺失字段必须写明数据不足。"
                         "spot_cleaner必须分析Bissell/Hoover等美系品牌与"
                         "Tineco/UWANT/Dreame等中国出海品牌的技术差异。"
+                        "不能把bought_past_month当作真实销量或市场份额。"
                         "sku_insights只能引用输入中存在的ASIN。建议应具体、可执行，并明确估算数据。"
                     ),
                 },
@@ -219,6 +356,11 @@ def analyze_market(
                 },
             ],
         )
+        result.setdefault("price_band_analysis", fallback["price_band_analysis"])
+        result.setdefault("brand_benchmark", fallback["brand_benchmark"])
+        result.setdefault("vacmaster_positioning", fallback["vacmaster_positioning"])
+        result.setdefault("capability_comparison", [])
+        result.setdefault("opportunity_gaps", fallback["opportunity_gaps"])
         result["analysis_mode"] = f"大模型：{settings.model}"
         return result
     except Exception as exc:
@@ -228,6 +370,14 @@ def analyze_market(
 
 def merge_sku_insights(products: pd.DataFrame, analysis: dict) -> pd.DataFrame:
     result = products.copy()
+    columns = [
+        "llm_pain_points",
+        "llm_selling_points",
+        "llm_use_scenarios",
+        "llm_differentiation",
+        "llm_confidence",
+    ]
+    result = result.drop(columns=[column for column in columns if column in result], errors="ignore")
     rows = []
     for item in analysis.get("sku_insights", []) or []:
         if not isinstance(item, dict):
@@ -251,13 +401,6 @@ def merge_sku_insights(products: pd.DataFrame, analysis: dict) -> pd.DataFrame:
                 "llm_confidence": str(item.get("confidence", "")),
             }
         )
-    columns = [
-        "llm_pain_points",
-        "llm_selling_points",
-        "llm_use_scenarios",
-        "llm_differentiation",
-        "llm_confidence",
-    ]
     if rows:
         insights = pd.DataFrame(rows).drop_duplicates("asin", keep="first")
         result = result.merge(insights, on="asin", how="left")

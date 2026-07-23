@@ -115,8 +115,23 @@ def build_bsr_workbook(
     )
     summary.append(["核心卖点", selling_text or "暂无足够好评"])
     summary.append(["品牌/技术对比", analysis.get("brand_comparison", "") or "暂无"])
+    positioning = analysis.get("vacmaster_positioning", {})
+    if isinstance(positioning, dict):
+        positioning_text = "\n".join(f"{key}: {value}" for key, value in positioning.items())
+    else:
+        positioning_text = str(positioning or "")
+    summary.append(["Vacmaster定位", positioning_text or "当前样本不足"])
+    summary.append(
+        ["产品/价格机会", "\n".join(map(str, analysis.get("opportunity_gaps", []))) or "暂无"]
+    )
     summary.append(["对Vacmaster建议", "\n".join(analysis.get("recommendations", []))])
-    summary.append(["数据说明", "榜单、价格、Coupon和评论可能受Amazon页面限制；估算值已明确标记。"])
+    summary.append(
+        [
+            "数据说明",
+            "榜单、详情、价格、Coupon和评论可能受Amazon页面限制；"
+            "评论正文需通过上传或合规数据源提供，估算值已明确标记。",
+        ]
+    )
     _style_sheet(summary)
     summary.column_dimensions["A"].width = 24
     summary.column_dimensions["B"].width = 100
@@ -125,8 +140,19 @@ def build_bsr_workbook(
     summary.row_dimensions[5].height = 80
     summary.row_dimensions[6].height = 90
     summary.row_dimensions[7].height = 100
+    summary.row_dimensions[8].height = 100
+    summary.row_dimensions[9].height = 100
 
     _write_frame(wb, "Top 50 SKUs Dataset", data)
+    price_bands = analysis.get("price_band_analysis", [])
+    if price_bands:
+        _write_frame(wb, "Price Band Analysis", pd.DataFrame(price_bands))
+    benchmark = analysis.get("brand_benchmark", [])
+    if benchmark:
+        _write_frame(wb, "Brand Benchmark", pd.DataFrame(benchmark))
+    capability = analysis.get("capability_comparison", [])
+    if capability:
+        _write_frame(wb, "Capability Comparison", pd.DataFrame(capability))
     if not reviews.empty:
         _write_frame(wb, "Review Dataset", reviews)
     return _bytes(wb)
